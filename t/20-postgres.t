@@ -25,7 +25,7 @@ my $bct = BucardoTesting->new({location => 'postgres'})
 ## The above runs one test for each passed in database x the number of test tables
 my $numtables = keys %tabletype;
 my $numsequences = keys %sequences;
-my $single_tests = 61;
+my $single_tests = 63;
 my $check_for_row_1 = 1;
 my $check_for_row_2 = 2;
 my $check_for_row_3 = 3;
@@ -70,7 +70,7 @@ $dbhX = $bct->setup_bucardo('A');
 for my $name (qw/ A B C D A1 /) {
     $t = "Adding database from cluster $name works";
     my ($dbuser,$dbport,$dbhost) = $bct->add_db_args($name);
-    $command = "bucardo add db $name dbname=bucardo_test user=$dbuser port=$dbport host=$dbhost status=active";
+    $command = "bucardo add db $name dbname=bucardo_test user=$dbuser port=$dbport host=$dbhost status=active conn=sslmode=allow";
     $res = $bct->ctl($command);
     like ($res, qr/Added database "$name"/, $t);
 }
@@ -179,6 +179,10 @@ like ($res, qr/Added sync "msync"/, $t);
 ## Add a row to A, to make sure it does not go anywhere with inactive syncs
 $bct->add_row_to_database('A', 1);
 
+## Clean out the droptest table for later testing
+$dbhA->do('TRUNCATE TABLE droptest_bucardo');
+$dbhA->commit();
+
 sub d {
     my $msg = shift || '?';
     my $time = scalar localtime;
@@ -202,6 +206,11 @@ $dbhX->do('LISTEN bucardo_syncdone_pgtest1');
 $dbhX->do('LISTEN bucardo_syncdone_samedb');
 $dbhX->commit();
 
+## Create a lock file to test the forced file locking
+my $lockfile = 'pid/bucardo-force-lock-pgtest1';
+open my $fh, '>', $lockfile or die qq{Could not create "$lockfile": $!\n};
+close $fh;
+
 ## Start up Bucardo again
 $bct->restart_bucardo($dbhX);
 
@@ -216,6 +225,17 @@ $t = q{Replicating to the same database via customname works};
 $SQL = 'SELECT inty FROM bucardo_test1_copy';
 $res = $dbhA->selectall_arrayref($SQL);
 is_deeply($res, [[1]], $t);
+
+## Make sure triggers and rules did not fire
+$SQL = 'SELECT * FROM droptest_bucardo';
+$sth = $dbhB->prepare($SQL);
+$count = $sth->execute();
+if ($count >= 1) {
+    diag Dumper $sth->fetchall_arrayref({});
+    BAIL_OUT "Found rows ($count) in the droptest table!";
+}
+$sth->finish();
+ok ('No rows found in the droptest table: triggers and rules were disabled');
 
 ## Switch to a 2 source sync
 is $bct->ctl('bucardo update sync pgtest1 status=inactive'), '', 'Set pgtest1 status=inactive';
@@ -361,6 +381,9 @@ $dbhC->commit();
 $dbhB->commit();
 $dbhA->commit();
 
+## Just in case, make sure 'bucardo upgrade' does not mess anything up
+$bct->ctl('bucardo upgrade');
+
 like $bct->ctl('bucardo kick sync pgtest3 0'),
     qr/^Kick\s+pgtest3:\s+${timer_regex}DONE!/,
     'Kick pgtest3 LIKE A BOSS' or die 'Sync failed, no point continuing';
@@ -435,7 +458,6 @@ else {
 $bct->add_row_to_database('A', 2);
 $bct->add_row_to_database('B', 3);
 
-$bct->ctl('bucardo message XXXXXXX');
 like $bct->ctl('bucardo kick sync pgtest3 0'),
     qr/^Kick\s+pgtest3:\s+${timer_regex}DONE!/,
     'Kick pgtest3 like it hurts' or die 'Sync failed, no point continuing';
@@ -445,6 +467,9 @@ $bct->check_for_row([[2],[3],[7]], [qw/A B C D/]);
 $t = q{add customcols returns expected message};
 $res = $bct->ctl('bucardo add customcols bucardo_test1 "SELECT id, data1, inty*30 AS inty"');
 like($res, qr/\QNew columns for public.bucardo_test1: "SELECT id, data1, inty*30 AS inty"/, $t);
+
+## Also test the rebuild_index functionality
+$res = $bct->ctl('bucardo update sync pgtest3 rebuild_index=1');
 
 ## We need to restart Bucardo entirely to change this. Someday, a reload sync will be enough.
 $bct->restart_bucardo($dbhX);
@@ -460,5 +485,7 @@ $bct->check_for_row([[2],[3],[7],[30]], [qw/D/], 'customcols', 'test1');
 unlink $service_temp_filename;
 
 $bct->ctl('bucardo stop');
+
+pass('Finished with testing');
 
 exit;

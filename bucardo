@@ -48,7 +48,7 @@ for (@ARGV) {
 
 ## All the variables we use often and want to declare here without 'my'
 use vars qw/$dbh $SQL $sth %sth $count $info %global $SYNC $GOAT $TABLE $SEQUENCE $DB $DBGROUP $HERD $RELGROUP
-            $CUSTOMCODE $CUSTOMNAME $CUSTOMCOLS /;
+            $CUSTOMCODE $CUSTOMNAME $CUSTOMCOLS $CLONE /;
 
 ## How to show dates from the database, e.g. start time of a sync
 my $DATEFORMAT       = $ENV{BUCARDO_DATEFORMAT} || q{Mon DD, YYYY HH24:MI:SS};
@@ -366,7 +366,7 @@ my $re_dbname = qr{\w[\w\d]*};
 ping() if $verb eq 'ping';
 
 ## Make sure the Bucardo database has the latest schema
-upgrade() if $verb eq 'upgrade' or $verb eq 'uprgade' or $verb eq 'ugprade';
+upgrade() if $verb =~ /^upgr/ or $verb eq 'uprgade' or $verb eq 'ugprade';
 
 ## All the rest of the verbs require use of global information
 ## Thus, we load everything right now
@@ -413,10 +413,16 @@ message()       if $verb eq 'message' or $verb eq 'msg';
 config()        if $verb eq 'set' or $verb eq 'show' or $verb eq 'config';
 
 ## Validate a sync
-validate()      if $verb eq 'validate';
+validate()      if $verb =~ /^vali/;
 
 ## Purge the delta/track tables
 purge()         if $verb eq 'purge';
+
+## Clone a database
+clone()         if $verb eq 'clone';
+
+## View delta statistics
+count_deltas()  if $verb eq 'delta' or $verb eq 'deltas';
 
 ## There are only a few valid verbs left, so we check for them now
 if ($verb ne 'kick' and $verb ne 'activate' and $verb ne 'deactivate'
@@ -665,6 +671,7 @@ sub superhelp {
             customname
             dbgroup
             deactivate
+            delta
             help
             inspect
             install
@@ -1265,6 +1272,116 @@ sub validate {
 } ## end of validate
 
 
+sub count_deltas {
+
+    ## Count up rows in the delta tables
+    ## Does not remove "unvacuumed" rows: assumes delta tables are getting emptied out by VAC
+    ## Arguments: optional 
+    ## Returns: nothing, exits
+
+    ## May want to see totals only
+    my $total_only = (defined $nouns[0] and $nouns[0] =~ /totals?/i) ? 1 : 0;
+
+    ## See if we want to limit it to specific databases
+    my %dblimit;
+    for my $name (@nouns) {
+
+        ## Do not limit if doing a total, even if other names are specified
+        next if $total_only;
+
+        ## Allow wildcards
+        if ($name =~ s/[%*]/.*/) {
+            for (grep { $_ =~ /$name/ } keys %$DB) {
+                $dblimit{$_}++;
+            }
+        }
+        elsif (exists $DB->{$name}) {
+            $dblimit{$name}++;
+        }
+    }
+
+    ## No matches means we stop right away
+    if (@nouns and !keys %dblimit and !$total_only) {
+        warn qq{No matching databases were found: try "bucardo list dbs"\n};
+        exit 1;
+    }
+
+    my $total = { grand => 0 };
+
+    for my $dbname (sort keys %$DB) {
+        my $db = $DB->{$dbname};
+
+        ## Only sources should get checked
+        if (! $db->{issource}) {
+            if (delete $dblimit{$dbname}) {
+                print "Skipping database $dbname: not a source\n";
+            }
+            elsif ($VERBOSE >= 1) {
+                print "Skipping $dbname: not a source\n";
+            }
+            next;
+        }
+
+        ## If we are limiting, possibly skip this one
+        next if keys %dblimit and ! exists $dblimit{$dbname};
+
+        ## Make sure it has a bucardo schema.
+        ## May not if validate_sync has never been run!
+        my $dbh = connect_database($dbname);
+
+        if (! schema_exists('bucardo')) {
+            warn "Cannot check database $dbname: no bucardo schema!\n";
+            next;
+        }
+
+        ## Grab all potential delta tables
+        $SQL = 'SELECT deltaname FROM bucardo.bucardo_delta_names';
+        for my $row (@{ $dbh->selectall_arrayref($SQL) }) {
+            my $tname = $row->[0];
+            $SQL = "SELECT count(*) FROM bucardo.$tname";
+            $count = $dbh->selectall_arrayref($SQL)->[0][0];
+            $total->{grand} += $count;
+            $total->{database}{$dbname} += $count;
+            if ($db->{status} ne 'active') {
+                $total->{databaseinactive}{$dbname} = 1;
+            }
+        }
+        $dbh->disconnect();
+    }
+
+    ## Stop here if we did not actually scan any databases because they are all non-source
+    if (! keys %{ $total->{database} }) {
+        print "No databases to check\n";
+        exit 1;
+    }
+
+    ## Figure out our sizes for a pretty alignment
+    my $grandmessage = 'Total deltas across all targets';
+    my $dbmessage = 'Total deltas for database';
+    my $size = { db => 0, largest => length $grandmessage, };
+    for my $db (keys %{ $total->{database} }) {
+        $size->{db} = length $db if length $db > $size->{db};
+        my $len = length "  $dbmessage $db";
+        $size->{largest} = $len if $len > $size->{largest};
+    }
+
+    printf "%*s: %s\n", $size->{largest}, $grandmessage, pretty_number($total->{grand});
+
+    ## Break it down by database
+    for my $db (sort keys %{ $total->{database} }) {
+        next if $total_only;
+        printf "%*s: %s%s\n",
+            $size->{largest},
+                "  $dbmessage $db",
+                    pretty_number($total->{database}{$db}),
+                        $total->{databaseinactive}{$db} ? ' (not active)' : '';
+    }
+
+    exit 0;
+
+} ## end of count_deltas
+
+
 sub purge {
 
     ## Purge the delta and track tables for one or more tables, for one or more databases
@@ -1462,60 +1579,71 @@ sub list_item {
     $thing = standardize_name($thing);
 
     SWITCH: {
+        $thing eq 'clone' and do {
+            list_clones();
+            last SWITCH;
+        };
         $thing eq 'config' and do {
             $verb = 'config';
             config();
             exit;
         };
         $thing eq 'customcode' and do {
-                list_customcodes();
-                last SWITCH;
+            list_customcodes();
+            last SWITCH;
         };
         $thing eq 'customname' and do {
-                list_customnames();
-                last SWITCH;
+            list_customnames();
+            last SWITCH;
         };
         $thing eq 'customcols' and do {
-                list_customcols();
-                last SWITCH;
+            list_customcols();
+            last SWITCH;
         };
         ## The dbgroup must be checked before the database (dbg vs db)
         $thing eq 'dbgroup' and do {
-                list_dbgroups();
-                last SWITCH;
+            list_dbgroups();
+            last SWITCH;
         };
         $thing eq 'database' and do {
-                list_databases();
-                last SWITCH;
+            list_databases();
+            last SWITCH;
         };
         $thing eq 'herd' and do {
-                list_herds();
-                last SWITCH;
+            list_herds();
+            last SWITCH;
         };
         $thing eq 'sync' and do {
-                list_syncs();
-                last SWITCH;
+            list_syncs();
+            last SWITCH;
         };
         $thing eq 'table' and do {
-                list_tables();
-                last SWITCH;
+            list_tables();
+            last SWITCH;
         };
         $thing eq 'sequence' and do {
-                list_sequences();
-                last SWITCH;
+            list_sequences();
+            last SWITCH;
         };
         $thing eq 'all' and do {
-                print "-- customcodes:\n";  list_customcodes();
-                print "-- customnames:\n";  list_customnames();
-                print "-- customcols:\n";   list_customcols();
-                print "-- dbgroups:\n";     list_dbgroups();
-                print "-- databases:\n";    list_databases();
-                print "-- relgroup:\n";     list_herds();
-                print "-- syncs:\n";        list_syncs();
-                print "-- tables:\n";       list_tables();
-                print "-- sequences:\n";    list_sequences();
-                print "\n";
-                last SWITCH;
+            ## Not shown on purpose: clones
+            if (keys %$CUSTOMCODE) {
+                print "-- customcodes:\n"; list_customcodes();
+            }
+            if (keys %$CUSTOMNAME) {
+                print "-- customnames:\n"; list_customnames();
+            }
+            if (keys %$CUSTOMCOLS) {
+                print "-- customcols:\n"; list_customcols();
+            }
+            print "-- dbgroups:\n";     list_dbgroups();
+            print "-- databases:\n";    list_databases();
+            print "-- relgroup:\n";     list_herds();
+            print "-- syncs:\n";        list_syncs();
+            print "-- tables:\n";       list_tables();
+            print "-- sequences:\n";    list_sequences();
+            print "\n";
+            last SWITCH;
         };
 
         ## catch all
@@ -4055,14 +4183,17 @@ sub list_herds {
 
     for my $row (@$info) {
         my $name = $row->{name};
-        my $h = $global{herd}{$name};
+        my $h = $HERD->{$name};
         printf 'Relgroup: %-*s ',
             $maxlen, $name;
         printf ' DB: %s ', $h->{db} if $h->{db};
         ## Got goats?
         if (exists $h->{goat}) {
             print ' Members: ';
-            print join ', ' => sort keys %{ $h->{goat} };
+            print join ', ' => sort {
+                $h->{goat}{$b}{priority} <=> $h->{goat}{$a}{priority}
+                    or $a cmp $b
+            } keys %{ $h->{goat} };
         }
         ## Got syncs?
         if (exists $h->{sync}) {
@@ -5037,7 +5168,7 @@ sub add_items_to_goat_table {
     for my $rel (sort { $a->{name} cmp $b->{name} } @$info) {
         # XXX Is it safe to assume UTF8 encoding here? Probably not
         my $name = $rel->{name};
-        if ($name !~ /^([\w ]+)\.([\w ]+)$/o) {
+        if ($name !~ /^([-\w ]+)\.([-\w ]+)$/o) {
             die qq{Invalid name, got "$name", but expected format "schema.relname"};
         }
         my ($schema,$table) = ($1,$2);
@@ -5192,6 +5323,183 @@ sub get_arg_items {
 
 } ## end of get_arg_items
 
+
+sub clone {
+
+    ## Put an entry in the clone table so the MCP can do some copyin'
+    ## Arguments: none, parses nouns
+    ## Returns: never, exits
+
+    my $doc_section = 'clone';
+
+    usage_exit($doc_section) unless @nouns;
+
+    ## Examples:
+    ## ./bucardo clone dbs=A:source,B,C relgroup=foo
+    ## ./bucardo clone sync=foobar
+    ## ./bucardo clone sync=foobar prime=A
+    ## ./bucardo clone dbs=A,B,C,D relgroup=foo notruncate=B,C
+
+    ## Optional sync to associate with:
+    my $sync;
+
+    ## Optional database group to use:
+    my $dbgroup;
+
+    ## The prime (winning) source database.
+    my $prime;
+
+    ## Optonal relgroup. Can be a list of tables
+    my $relgroup;
+
+    ## Optional options :)
+    my $options;
+
+    for my $word (@nouns) {
+
+        ## Check for an optional sync name.
+        if ($word =~ /(?i)sync(?-i)\s*[:=]\s*(\w.*?)\s*$/) {
+            my $syncname = $1;
+            if (! exists $SYNC->{$syncname}) {
+                die qq{Invalid sync "$syncname"\n};
+            }
+            ## Have we already specified a sync?
+            if (defined $sync) {
+                die qq{Cannot specify more than one sync\n};
+            }
+
+            $sync = $syncname;
+            next;
+        }
+
+        ## Check for an optional dbgroup
+        if ($word =~ /(?i)dbg(?-i)\w*\s*[:=]\s*(\w.*?)\s*$/) {
+            my $dbgroupname = $1;
+            if (! exists $DBGROUP->{$dbgroupname}) {
+                die qq{Invalid database group "$dbgroupname"\n};
+            }
+            ## Have we already specified a database group?
+            if (defined $dbgroup) {
+                die qq{Cannot specify more than one database group\n};
+            }
+            $dbgroup  = $dbgroupname;
+            next;
+        }
+
+        ## Check for an optional relgroup
+        if ($word =~ /(?i)(?:relgroup|table)s?(?-i)\w*\s*[:=]\s*(\w.*?)\s*$/) {
+            my $relgroupname = $1;
+            ## May be a relgroup, or a list of tables
+            if (exists $RELGROUP->{$relgroupname}) {
+                $relgroup = $relgroupname;
+                next;
+            }
+            ## Must be one or more tables. See if we can find them, and shove into a relgroup
+
+            ## Go through all the items and try to find matches
+            ## Assumes tables are all in CSV format
+            my @tablelist = split /\s*,\s*/ => $relgroupname;
+            my $goatlist = get_goat_ids(args => \@tablelist, type => 'table');
+
+            ## Cannot proceed unless we have a match for every table
+            if (keys %{ $goatlist->{nomatch} }) {
+                print "Cannot clone because the following tables were not found:\n";
+                for my $badname (sort keys %{ $goatlist->{nomatch} }) {
+                    print "  $badname\n";
+                }
+                exit 1;
+            }
+
+            ## We need to generate a relgroup name
+            ## TODO: See if any existing relgroups match exactly
+            my $basename = 'clone_relgroup';
+            my $number = 1;
+            {
+                $relgroupname = "$basename$number";
+                last if ! exists $RELGROUP->{$relgroupname};
+                $number++;
+                redo;
+            }
+
+            $SQL = 'INSERT INTO bucardo.herd(name) VALUES (?)';
+            $sth = $dbh->prepare($SQL);
+            $sth->execute($relgroupname);
+
+            $SQL = 'INSERT INTO bucardo.herdmap (herd,goat) VALUES (?,?)';
+            $sth = $dbh->prepare($SQL);
+            for my $goat (values %{ $goatlist->{relations} }) {
+                $sth->execute($relgroupname, $goat->{goat}[0]{id});
+            }
+
+            next;
+        }
+
+        ## Check for a prime
+        if ($word =~ /(?i)prime(?-i)\w*\s*[:=]\s*(\w.*?)\s*$/) {
+            $prime = $1;
+            for my $candidate (split /\s*,\s*/ => $prime) {
+                ## This must be a valid database
+                if (! exists $DB->{$candidate}) {
+                    die qq{The prime option must specify a known database (not "$candidate")\n};
+                }
+            }
+            $options .= "prime=$prime;";
+            next;
+        }
+
+        die qq{Unknown option: $word\n};
+
+    } ## end checking each noun
+
+    ## Must have at least one of sync or dbgroup
+    if (! defined $sync and ! defined $dbgroup) {
+        die qq{Must provide a sync or a database group\n};
+    }
+
+    ## Generate a list of databases to make sure we know which is prime
+    my $dbrole;
+    if (defined $dbgroup) {
+        for my $row (values %{ $DBGROUP->{$dbgroup}{db} }) {
+            $dbrole->{ $row->{role} }{ $row->{db} } = 1;
+        }
+    }
+    else {
+        for my $db (values %{ $SYNC->{$sync}{dblist} }) {
+            $dbrole->{ $db->{role} }{ $db->{db} } = 1;
+        }
+    }
+
+    ## If we have more than one source, make sure we know how to proceed
+    if (keys %{ $dbrole->{source}} > 1) {
+        ## TODO: Allow more than one somehow
+        if (! defined $prime) {
+            warn qq{Must provide a prime so we know which database to copy from\n};
+            my $dblist = join ', ' => sort keys %{ $dbrole->{source} };
+            warn qq{Should be one of: $dblist\n};
+            exit 1;
+        }
+    }
+
+    ## Clean up the options by removing any trailing semicolons
+    if (defined $options) {
+        $options =~ s/;$//;
+    }
+
+    $SQL = 'INSERT INTO bucardo.clone(status,sync,dbgroup,relgroup,options) VALUES (?,?,?,?,?) RETURNING id';
+    $sth = $dbh->prepare($SQL);
+    $sth->execute('new', $sync, $dbgroup, $relgroup, $options);
+    my $id = $sth->fetchall_arrayref()->[0][0];
+
+    ## Tell the MCP there is a new clone
+    $dbh->do('NOTIFY bucardo_clone_ready');
+
+    confirm_commit();
+
+    $QUIET or print qq{Clone $id has been started. Track progress with "bucardo status clone $id"\n};
+
+    exit 0;
+
+} ## end of clone
 
 
 
@@ -5757,7 +6065,7 @@ sub append_reason_file {
 
 sub set_sync_status {
 
-    ## Set detailed information about syncs from the synrun table
+    ## Set detailed information about syncs from the syncrun table
     ## Arguments: zero or one (hashref)
     ## 1. Hashref containing a. syncs=arrarref of syncnames
     ## Returns: hashref indicating maximum lengths of inner information
@@ -6131,7 +6439,57 @@ sub process_args {
 } ## end of process_args
 
 
+sub list_clones {
 
+    ## Show information about clones. Queries the bucardo.clone table
+    ## Arguments: zero or more
+    ## 1+ Clone id to view.
+    ## Returns: 0 on success, -1 on error
+    ## Example: bucardo list clones
+
+    ## Might be no clones yet
+    if (! keys %$CLONE) {
+        print "No clones have been created yet\n";
+        return -1;
+    }
+
+    ## Keep track of specific requests
+    my $cloneids;
+
+    for my $term (@nouns) {
+
+        if ($term =~ /^(\d+)$/) {
+            my $id = $1;
+            if (! exists $CLONE->{$id}) {
+                die qq{No such clone id "$id": try bucardo list clones\n};
+            }
+            $cloneids->{$id}++;
+        }
+
+    } ## end each term
+
+    ## Print them out in numeric order
+    for my $clone (sort { $a->{id} <=> $b->{id} } values %$CLONE) {
+        ## TODO: right justify numbers
+        next if keys %$cloneids and ! exists $cloneids->{$clone->{id}};
+        print "Clone #$clone->{id}";
+        print " Status: $clone->{status}";
+        defined $clone->{sync} and print "  Sync: $clone->{sync}";
+        defined $clone->{dbgroup} and print " Dbgroup: $clone->{dbgroup}";
+        defined $clone->{relgroup} and print "  Relgroup: $clone->{relgroup}";
+        defined $clone->{started} and print "  Started: $clone->{pstarted}";
+        defined $clone->{ended} and print "  Ended: $clone->{pstarted}";
+        if (defined $clone->{options}) {
+            print "  $clone->{options}";
+        }
+        ## Print last, on a new line:
+        defined $clone->{summary} and print "\n  Summary: $clone->{summary}";
+        print "\n";
+    }
+
+    return 0;
+
+} ## end of list_clones
 
 
 sub list_customcodes {
@@ -6849,7 +7207,10 @@ sub add_all_goats {
             }
             next;
         }
+
         $VERBOSE >= 2 and warn "Attempting to add relation $S.$T\n";
+        ## We want a savepoint as we may retract the addition (e.g. no pkey and pkonly specified)
+        $dbh->do('SAVEPOINT newtable');
         eval {
             my @arg = ($db->{name},$S,$T,$type);
             push @arg => $bcargs->{makedelta} if exists $bcargs->{makedelta};
@@ -6875,18 +7236,26 @@ sub add_all_goats {
         $id = $dbh->selectall_arrayref($SQL)->[0][0];
         $VERBOSE >= 2 and warn "ID of new table $S.$T is $id\n";
 
+        ## Grab it back from the database
+        $SQL = 'SELECT * FROM goat WHERE id = ?';
+        $sth = $dbh->prepare($SQL);
+        $sth->execute($id);
+        $tinfo = $sth->fetchall_arrayref({})->[0];
+
+        ## If it has no primary key and pkonly is set, abandon this change
+        if ($bcargs->{pkonly} and 'table' eq $type and ! length $tinfo->{pkey}) {
+            $VERBOSE >= 1 and warn "Not adding table $S.$T: no pkey\n";
+            $dbh->do('ROLLBACK TO newtable');
+            next;
+        }
+
         $count{added}++;
         $new{$S}{$T} = 1;
       HERD:
         if ($herd) {
-            if (! defined $tinfo) {
-                $SQL = 'SELECT * FROM goat WHERE id = ?';
-                $sth = $dbh->prepare($SQL);
-                $sth->execute($id);
-                $tinfo = $sth->fetchall_arrayref({})->[0];
-            }
+            ## Need to check again as the previous check above was only for brand new tables
             if ($bcargs->{pkonly} and 'table' eq $type and ! length $tinfo->{pkey}) {
-                warn "Not adding table $S.$T to relgroup: no pkey\n";
+                $VERBOSE >= 1 and warn "Not adding table $S.$T to relgroup: no pkey\n";
             }
             else {
                 $SQL = 'SELECT 1 FROM herdmap WHERE herd=? AND goat = ?';
@@ -7503,10 +7872,12 @@ sub upgrade {
     }
     if ($schema_version ne $VERSION) {
         die qq{Cannot continue: bucardo is version $VERSION, but $schema_file is version $schema_version\n};
-   }
+    }
 
     $dbh->do(q{SET escape_string_warning = 'OFF'});
-    $dbh->do(q{SET standard_conforming_strings = 'ON'});
+    if ($dbh->{pg_server_version} >= 80200) {
+        $dbh->do(q{SET standard_conforming_strings = 'ON'});
+    }
 
     my $changes = 0;
 
@@ -7579,6 +7950,7 @@ sub upgrade {
     my @altered_columns = (
         ['bucardo', 'goat', 'rebuild_index',     'BOOL2SMALLINT1'],
         ['bucardo', 'goat', 'schemaname',        'NO DEFAULT'],
+        ['bucardo', 'sync', 'isolation_level',   'NO DEFAULT'],
         ['bucardo', 'sync', 'rebuild_index',     'BOOL2SMALLINT1'],
         ['bucardo', 'sync', 'standard_conflict', 'RENAME conflict_strategy'],
         ['bucardo', 'sync', 'ping',              'RENAME autokick'],
@@ -8206,13 +8578,17 @@ sub connect_database {
         $opt = { name => $opt };
     }
 
+    if (! exists $DB->{$opt->{name}}) {
+        die qq{Unknown database "$opt->{name}": try bucardo list dbs\n};
+    }
+
     if (exists $opt->{name}) {
         $SQL = qq{SELECT bucardo.db_getconn('$opt->{name}')};
         my $conn = $dbh->selectall_arrayref($SQL)->[0][0];
         my ($type,$dsn,$user,$pass) = split /\n/ => $conn;
 
         if ($type ne 'postgres') {
-            return "Cannot return a handle for database type $type";
+            die "Cannot return a handle for database type $type\n";
         }
 
         eval {
@@ -8614,7 +8990,7 @@ sub install {
 
     ## If no number 1 seen, no bucardo user, so create it
     if ($res !~ /1/) {
-      print "Creating superuser 'bucardo'\n";
+      $QUIET or print "Creating superuser 'bucardo'\n";
 
       ## Generate a new random password
       my $pass = generate_password();
@@ -8775,6 +9151,8 @@ sub standardize_name {
     return 'all'        if $name =~ /^all$/i;
 
     return 'config'     if $name =~ /^config/i;
+
+    return 'clone'      if $name =~ /^clon/i;
 
     return $name;
 
@@ -9278,6 +9656,18 @@ JOIN goat g ON (g.id = c.goat)
         }
     }
 
+    ## Grab all clone information
+    $SQL = qq{SELECT *,
+      TO_CHAR(started,'$DATEFORMAT') AS pstarted,
+      TO_CHAR(ended,'$DATEFORMAT') AS pended
+      FROM bucardo.clone};
+    $sth = $dbh->prepare($SQL);
+    $sth->execute();
+    $CLONE = {};
+    for my $row (@{ $sth->fetchall_arrayref({}) }) {
+        $CLONE->{$row->{id}} = $row;
+    }
+
     return;
 
 } ## end of load_bucardo_info
@@ -9400,8 +9790,8 @@ sub find_best_db_for_searching {
             $a->[1] <=> $b->[1]
             ## First created are first
             or $a->[2] <=> $b->[2]
-            ## All else fails, sort by name (should not happen)
-            or $b->[0] cmp $a->[0] }
+            ## All else fails, sort by name
+            or $a->[0] cmp $b->[0] }
         map { [
                $_,
                exists $DB->{$_}{issource} ? 0 : 1,
@@ -9722,6 +10112,10 @@ Validates one or more syncs.
 Purges the delta and track tables for one or more tables, for one or more
 databases.
 
+=item C<< delta [<database(s)>] >>
+
+Show the delta counts for each source target.
+
 =item C<< help [<command> [<action>]] >>
 
 Shows help.
@@ -9735,7 +10129,7 @@ Shows help.
   -P --db-pass       PASS  Database password.
   -h --db-host       HOST  Database server host name.
   -p --db-port       PORT  Database server port number.
-     --bucardorc     FILE  Use specified .bucarorc file.
+     --bucardorc     FILE  Use specified .bucardorc file.
      --no-bucardorc        Do not use .bucardorc file.
      --quiet               Incremental quiet.
      --verbose             Incremental verbose mode.
@@ -11655,6 +12049,14 @@ sync is started or activated.
 Purges the delta and track tables for one or more tables, for one or more
 databases. Use the keyword "all" to validate all tables, or specify one or
 more tables to validate.
+
+=head2 delta
+
+  bucardo delta [total] [<database>...]
+
+Show the current delta count for each source target. Provide a list of databases
+to limit it to just the given ones. Wildcards are allowed. Use the special name
+"totals" to show only the grand total.
 
 =head2 help
 
